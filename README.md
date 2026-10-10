@@ -8,13 +8,13 @@ never runs on the hot path.**
 · [spec coverage dashboard](https://tuna-os.github.io/spindle/dashboard.html)
 · [SPEC.md](SPEC.md)
 
-> **Status: an experiment under construction, not a deployment.** The
-> client-server surface is broad and tested, federation interoperates with real
-> Synapse, and nothing here has ever run in production. Releases are weekly
-> `v0.0.x` prereleases that name a build and promise nothing else: no
-> upgrade path, and the storage format has already broken once —
-> deliberately, with the [test that caught it](crates/spindle-store/tests/backend_compatibility.rs)
-> kept and inverted rather than deleted.
+> **Status: prerelease.** The client-server surface is broad and tested,
+> and federation interoperates with Synapse. The first supported maturity
+> line is `v0.1.x`, subject to the exact candidate checks and evidence in
+> [v0.1.0 readiness](docs/v0.1.0-readiness.md). Use the newest patch and the
+> [operator guide](docs/operations.md). Explicit migrations can need downtime;
+> rollback restores a pre-migration backup. Earlier `v0.0.x` tags identify
+> experimental builds and receive no backports.
 
 ---
 
@@ -157,10 +157,11 @@ skip it and they don't" was never true of them. What linear storage removes is
 the per-event *bookkeeping* the algorithm needs in order to exist — extremity
 sets, state-group delta stacks — not the algorithm.
 
-**The load-bearing claim is the equivalence theorem** (SPEC §9.3): that
-window-bounded state resolution produces exactly what full state resolution
-would. It is tested as one, differentially against `ruma-state-res`, for every
-fork the fast path claims to handle. A counterexample is a release blocker.
+**State resolution must agree with Matrix.** The old slot-wise fork merge
+had counterexamples and was retired (ADR 0005). Differing fork states use
+the room version's resolver. Scheduled checks preserve the counterexamples,
+compare with `ruma-state-res`, and test the fork-window search against an
+exhaustive walk. A disagreement on the live path is a release blocker.
 
 **Losses are published next to wins.** [docs/benchmarks.md](docs/benchmarks.md)
 carries the cells where Spindle lost, the investigations, and two claims that

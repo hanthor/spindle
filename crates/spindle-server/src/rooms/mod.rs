@@ -290,6 +290,7 @@ pub struct Rooms {
     /// that event for that client forever, silently. Building and proving it
     /// first makes the lock change mechanical instead of frightening.
     stream: crate::stream::Stream,
+    issued_position: Mutex<u64>,
     /// Woken whenever an event lands, so a long-polling `/sync` does not have
     /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
     /// shape at server granularity, which is enough while there is one lock.
@@ -449,6 +450,29 @@ pub struct TimelineEvent {
     pub json: Value,
 }
 
+/// A reserved side-stream position. Keep this guard until persistence finishes.
+pub struct SideStreamWrite<'a> {
+    stream: &'a crate::stream::Stream,
+    id: u64,
+    wake: &'a tokio::sync::Notify,
+}
+
+impl SideStreamWrite<'_> {
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for SideStreamWrite<'_> {
+    fn drop(&mut self) {
+        // A failed write leaves a hole, not a permanently stalled watermark.
+        if self.stream.finish(self.id) {
+            self.wake.notify_waiters();
+        }
+    }
+}
+
 impl Rooms {
     /// A `Rooms` with a registry of its own, for tests and tools that do
     /// not scrape it; the server uses [`Rooms::with_metrics`].
@@ -496,6 +520,7 @@ impl Rooms {
             // they point at -- the same shape of bug as a room registry that
             // does not survive a restart, and worse, because it corrupts
             // rather than merely forgets.
+            issued_position: Mutex::new(read_stream_checkpoint(store_for_stream.as_ref())),
             stream: crate::stream::Stream::resuming_at(highest_stream_id(
                 store_for_stream.as_ref(),
                 stream_high,
@@ -1368,7 +1393,8 @@ impl Rooms {
         event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
-        let stream_id = self.allocate_stream_id();
+        let stream_write = self.reserve_stream_id();
+        let stream_id = stream_write.id();
         spindle_store::Store::put(
             self.store.as_ref(),
             &spindle_core::keys::user_room(
@@ -2364,7 +2390,8 @@ impl Rooms {
             if let Some(object) = pdu.as_object_mut() {
                 object.remove("event_id");
             }
-            let seq = self.allocate_stream_id();
+            let stream_write = self.reserve_stream_id();
+            let seq = stream_write.id();
             spindle_store::Store::put(
                 self.store.as_ref(),
                 &spindle_core::keys::federation_outbox(destination, seq),
@@ -3658,24 +3685,54 @@ impl Rooms {
         self.appended.notify_waiters();
     }
 
-    /// Take the next global sequence number without writing a stream row.
+    /// Reserve a side-stream position until its writer finishes.
     ///
-    /// To-device messages draw from the same counter room events do, so a
-    /// sync token positions both at once — which is what lets `since`
-    /// acknowledge to-device deliveries with no second cursor. The stream
-    /// scan skips absent ids already, so a gap where a to-device message sat
-    /// costs nothing.
-    pub fn allocate_stream_id(&self) -> u64 {
-        // Allocated and committed together: these ids name positions on
-        // side streams (to-device, receipts) that are durable by the time
-        // the caller has one, so there is no window for them to be in.
-        let id = self.stream.allocate();
-        self.stream.commit(id);
-        id
+    /// Keep the returned guard alive through every store write. Dropping it
+    /// releases the position and wakes sync waiters, including on error or
+    /// panic. Publishing at allocation lets a sync acknowledge a message
+    /// before it exists, then delete it unseen when the write finally lands.
+    #[must_use]
+    pub fn reserve_stream_id(&self) -> SideStreamWrite<'_> {
+        SideStreamWrite {
+            stream: &self.stream,
+            id: self.stream.allocate(),
+            wake: &self.appended,
+        }
     }
 
     pub fn stream_position(&self) -> u64 {
         self.stream.position()
+    }
+
+    /// Persist a position before issuing a token that acknowledges it.
+    /// Queue rows and ephemeral marks can disappear; they cannot be the only
+    /// evidence that a client already holds a position above the room log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the checkpoint cannot be made durable.
+    pub fn checkpoint_stream_position(&self, position: u64) -> Result<(), RoomError> {
+        if position > self.stream_position() {
+            return Err(RoomError::StateUnavailable(
+                "uncommitted stream position".to_owned(),
+            ));
+        }
+        let mut issued = self
+            .issued_position
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if position > *issued {
+            spindle_store::Store::commit(
+                self.store.as_ref(),
+                &[(
+                    spindle_core::keys::stream_checkpoint(),
+                    position.to_be_bytes().to_vec(),
+                )],
+                spindle_store::Durability::Strict,
+            )?;
+            *issued = position;
+        }
+        Ok(())
     }
 
     /// Note that `user_id` sent a receipt in `room_id`: a position on the
@@ -3683,7 +3740,8 @@ impl Rooms {
     /// reader's own next sync answers now and carries the counts the
     /// receipt changed.
     pub fn mark_receipt(&self, room_id: &str, user_id: &str) {
-        let position = self.allocate_stream_id();
+        let stream_write = self.reserve_stream_id();
+        let position = stream_write.id();
         self.receipt_marks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3795,6 +3853,7 @@ impl Rooms {
         state_after: bool,
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
+        self.checkpoint_stream_position(position)?;
         let joined = self.joined(user_id)?;
         let invited = self.invited_since(user_id, since, position)?;
         let knocked = self.knocked(user_id)?;
@@ -5909,7 +5968,8 @@ impl Rooms {
             .filter(|domain| !live.iter().any(|known| known == *domain));
 
         for destination in live.iter().map(String::as_str).chain(departing) {
-            let seq = self.allocate_stream_id();
+            let stream_write = self.reserve_stream_id();
+            let seq = stream_write.id();
             spindle_store::Store::put(
                 self.store.as_ref(),
                 &spindle_core::keys::federation_outbox(destination, seq),
@@ -7482,6 +7542,14 @@ fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
     written
 }
 
+fn read_stream_checkpoint(store: &FjallStore) -> u64 {
+    spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+        .unwrap_or(0)
+}
+
 /// The highest stream id already on disk, or 0 for a fresh store.
 ///
 /// `from_stream` is [`highest_stream_row`], passed in because the caller has
@@ -7583,7 +7651,23 @@ fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
         .flatten()
         .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
         .unwrap_or(0);
+    // An appservice can drain the last to-device row without any Matrix
+    // client syncing. Its durable acknowledgement is also a counter floor.
+    let from_appservices = spindle_store::ReadView::scan_prefix(
+        store,
+        &[
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::AppserviceCursor as u8,
+        ],
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    .max()
+    .unwrap_or(0);
     from_stream
+        .max(read_stream_checkpoint(store))
+        .max(from_appservices)
         .max(from_push_cursor)
         .max(from_to_device)
         .max(from_device_lists)
