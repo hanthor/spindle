@@ -189,6 +189,36 @@ pub(crate) async fn receive_brokered_pdu(
     }
 }
 
+/// Take one PDU a room's hub handed back with "your head is stale"
+/// (MSC3995 hub mode, #22) through the ordinary receive path.
+///
+/// The hub is the server that answered, but not the event's author: it is
+/// returning other servers' events this one has not received yet. The
+/// receive path takes them as relayed PDUs (#631): each verifies against
+/// the keys of the servers its room version requires, its sender's server
+/// among them, exactly as it will when that server's own delivery arrives
+/// -- which then finds it already held.
+#[cfg(feature = "hub-mode")]
+pub(crate) async fn receive_from_hub(
+    state: &AppState,
+    hub: &str,
+    pdu: &Value,
+) -> (String, Result<(), String>) {
+    let Some(signer) = pdu["sender"]
+        .as_str()
+        .and_then(|sender| sender.split_once(':'))
+        .map(|(_, domain)| domain)
+    else {
+        return ("$malformed".to_owned(), Err("no sender".to_owned()));
+    };
+    if signer == state.config.server.name {
+        // Our own event, which we already hold or never sent.
+        let event_id = pdu["event_id"].as_str().unwrap_or("$ours").to_owned();
+        return (event_id, Ok(()));
+    }
+    recovery::receive(state, hub, None, pdu).await
+}
+
 /// The version a received PDU is to be read under.
 ///
 /// A create event carries it; any other event belongs to a room, and the
@@ -514,6 +544,12 @@ pub(crate) async fn send_transaction(
         .iter()
         .take(100)
     {
+        // MSC3995 hub attestations (#22), in a build with the feature and
+        // the switch on; anywhere else an unknown EDU type, dropped below.
+        #[cfg(feature = "hub-mode")]
+        if crate::hub::takes_edu(&state, &origin, edu).await {
+            continue;
+        }
         let edu_type = crate::metrics::EduType::of(edu["edu_type"].as_str());
         let result = match edu_type {
             crate::metrics::EduType::Typing => apply_typing(&state, &origin, &edu["content"]),

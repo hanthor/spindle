@@ -147,6 +147,8 @@ mod erasure;
 pub mod extremities;
 mod federation;
 mod gaps;
+#[cfg(feature = "hub-mode")]
+mod hub;
 mod policy;
 mod read;
 mod synapse_positions;
@@ -161,6 +163,8 @@ pub use unread::{Receipt, Scored, Unread, Unscored};
 use unread::{ScoreTally, UnreadIndex};
 
 pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
+#[cfg(feature = "hub-mode")]
+pub use hub::{ChainEntry, HUB_EVENT_TYPE, Sequenced};
 
 pub struct Rooms {
     policy_federation: Mutex<Option<std::sync::Weak<crate::federation::Federation>>>,

@@ -32,6 +32,8 @@ pub mod email;
 pub mod errors;
 pub mod federation;
 pub mod filters;
+#[cfg(feature = "hub-mode")]
+pub mod hub;
 pub mod import;
 pub mod inbound;
 pub mod livekit;
@@ -132,6 +134,10 @@ pub struct AppState {
     /// and restarted. Present in every state — the remote model and the
     /// unconfigured server simply report through it rather than spawn.
     pub sfu: Arc<livekit::SfuSupervisor>,
+    /// MSC3995 hub mode's process state (#22): who answered the capability
+    /// probe, how far each hubbed room's attestations have gone, counters.
+    #[cfg(feature = "hub-mode")]
+    pub hub: Arc<hub::Hub>,
 }
 
 /// Why the application cannot be built. Both are startup-fatal on purpose:
@@ -510,6 +516,8 @@ fn app_state_with(
         metrics,
         mailer,
         sfu: livekit::SfuSupervisor::new(config_for_sfu, store_for_sfu),
+        #[cfg(feature = "hub-mode")]
+        hub: Arc::new(hub::Hub::new()),
     };
     // Resident rooms are counted at scrape time, from the registry itself,
     // rather than kept as a counter every admission path would have to
